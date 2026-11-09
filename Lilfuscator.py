@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Lilfuscator v2.1.0
+Lilfuscator v2.2.0
 ==================
 Python source-code obfuscator: layered packing, AST transformations,
 decoy classes, junk code, polymorphic loaders, chained-key integrity.
@@ -33,7 +33,7 @@ import sys
 import time
 import zlib
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # --------------------------------------------------------------------------
 # Profiles
@@ -311,9 +311,10 @@ class LocalRenamer(ast.NodeTransformer):
     enclosing scope and are renamed only there.
     """
 
-    def __init__(self, rng, style="random"):
+    def __init__(self, rng, style="random", preserve=frozenset()):
         self.rng = rng
         self.style = style
+        self.preserve = set(preserve)
 
     def visit_FunctionDef(self, node):
         self._rename_scope(node)
@@ -346,6 +347,7 @@ class LocalRenamer(ast.NodeTransformer):
             elif isinstance(n, ast.Nonlocal):
                 locals_.difference_update(n.names)
         locals_.discard("__name__")
+        locals_ -= self.preserve
         if not locals_:
             return
         mapping = {}
@@ -547,21 +549,30 @@ def gen_trash(rng, count):
 # 7. Packer: compile -> marshal -> N chained layers
 # --------------------------------------------------------------------------
 
-def pack_payload(code_bytes: bytes, layers: int, rng, bind_fp: bytes = b""):
+def pack_payload(code_bytes: bytes, layers: int, rng, bind_fp: bytes = b"",
+                 comp_choice="auto", enc_choice="auto"):
     """Returns (final_blob, specs). Specs are outermost-first tuples
-    (enc_op, comp_op, seed_hex, bind_flag). Layer keys derive from
-    (seed, layer index, machine fingerprint) - there is intentionally NO
-    separate integrity check: tampering with any byte produces garbage
-    that crashes inside decompress/marshal. Nothing to NOP out."""
+    (enc_op, comp_op, seed_hex, bind_flag). comp_choice/enc_choice:
+    'auto' (random per layer) or a fixed op from _COMPRESS/_ENCODE keys;
+    comp 'none' = identity. Layer keys derive from (seed, machine
+    fingerprint) - there is intentionally NO separate integrity check:
+    tampering with any byte produces garbage that crashes inside
+    decompress/marshal. Nothing to NOP out."""
     blob = code_bytes
     specs = []
     for i in range(layers):
-        comp_op = rng.choice(list(_COMPRESS))
-        enc_op = rng.choice(list(_ENCODE))
+        comp_op = (comp_choice if comp_choice != "auto"
+                   else rng.choice(list(_COMPRESS)))
+        enc_op = (enc_choice if enc_choice != "auto"
+                  else rng.choice(list(_ENCODE)))
+        if comp_op == "none":
+            comp_op, comp_fn = "n", (lambda b: b)
+        else:
+            comp_fn = _COMPRESS[comp_op][0]
         seed = rng.getrandbits(128).to_bytes(16, "big")
         fp = bind_fp if (bind_fp and i == 0) else b""
         key = hashlib.sha256(seed + fp).digest()[:16]
-        blob = _ENCODE[enc_op][0](rc4(key, _COMPRESS[comp_op][0](blob)))
+        blob = _ENCODE[enc_op][0](rc4(key, comp_fn(blob)))
         specs.insert(0, (enc_op, comp_op, seed.hex(), bool(fp)))
     return blob, specs
 
@@ -617,7 +628,7 @@ def %(adbg)s():
 '''
 
 
-def build_loader(blob, specs, rng, profile):
+def build_loader(blob, specs, rng, profile, code_hash=None):
     style = profile.get("rename_style", "random")
     while True:
         n = [gen_name(rng, style) for _ in range(20)]
@@ -655,7 +666,8 @@ def build_loader(blob, specs, rng, profile):
     helpers += (
         "\n" + decn + " = {'b85': " + b64n + ".b85decode, 'b64': "
         + b64n + ".b64decode, 'hx': lambda _b: bytes.fromhex(_b.decode())}\n"
-        + dcpn + " = {'z': " + zlbn + ".decompress, 'x': " + lzmn + ".decompress}\n"
+        + dcpn + " = {'z': " + zlbn + ".decompress, 'x': " + lzmn
+        + ".decompress, 'n': lambda _b: _b}\n"
     )
 
     prelude = ""
@@ -664,12 +676,26 @@ def build_loader(blob, specs, rng, profile):
     if profile.get("junk"):
         prelude += gen_junk(rng, style)
 
-    body_core = (
-        blobn + " = " + repr(blob) + "\n"
-        + specn + " = " + repr([(e, c, s, b) for e, c, s, b in specs]) + "\n"
-        + fpvn + " = ((str(" + pltn + ".node()) + '|' + str(" + uidn
-        + ".getnode())).encode() if " + uidn + " is not None else b'')\n"
-    )
+    body_core = ""
+    k = int(profile.get("chunks", 1) or 1)
+    if k > 1 and len(blob) >= k * 2:
+        parts = []
+        remaining = blob
+        for j in range(k):
+            if j == k - 1:
+                parts.append(remaining)
+            else:
+                cut = rng.randint(1, len(remaining) - (k - j - 1))
+                parts.append(remaining[:cut])
+                remaining = remaining[cut:]
+        body_core += (blobn + " = b''.join(["
+                      + ", ".join(repr(p) for p in parts) + "])\n")
+    else:
+        body_core += blobn + " = " + repr(blob) + "\n"
+    body_core += (specn + " = " + repr([(e, c, s, b) for e, c, s, b in specs])
+                  + "\n"
+                  + fpvn + " = ((str(" + pltn + ".node()) + '|' + str(" + uidn
+                  + ".getnode())).encode() if " + uidn + " is not None else b'')\n")
 
     variant = rng.randint(0, 2)
     if variant == 0:
@@ -713,6 +739,11 @@ def build_loader(blob, specs, rng, profile):
         "exec(" + marn + ".loads(" + blobn + "), " + mgl + ")\n"
     )
 
+    if code_hash:
+        tail = (keyn + " = " + hshn + ".sha256(" + blobn + ").digest()\n"
+                "if " + keyn + " != " + repr(code_hash) + ":\n"
+                "    " + osn + "._exit(" + str(rng.randint(1, 255)) + ")\n"
+                + tail)
     adbg = _ADBG_SRC % fmt if profile.get("antidebug") else ""
     parts = [head, prelude, helpers, adbg, body_core, driver, tail]
     return "".join(parts)
@@ -745,9 +776,14 @@ def obfuscate_source(src: str, profile: dict, seed=None) -> str:
     ast.fix_missing_locations(tree)
     code = compile(tree, "<lilfuscated>", "exec")
     bind_fp = machine_fingerprint() if profile.get("bind") else b""
-    blob, specs = pack_payload(marshal.dumps(code), profile["layers"], rng,
-                               bind_fp=bind_fp)
-    loader = build_loader(blob, specs, rng, profile)
+    payload = marshal.dumps(code)
+    code_hash = (hashlib.sha256(payload).digest()
+                 if profile.get("integrity") else None)
+    blob, specs = pack_payload(
+        payload, profile["layers"], rng, bind_fp=bind_fp,
+        comp_choice=profile.get("comp_choice", "auto"),
+        enc_choice=profile.get("enc_choice", "auto"))
+    loader = build_loader(blob, specs, rng, profile, code_hash=code_hash)
     compile(loader, "<lilfuscator-output>", "exec")   # validate output
     return loader
 
@@ -928,28 +964,260 @@ def _build_arg_parser():
     return ap
 
 
+DEFAULT_PRESERVE = ["__init__", "__main__", "main", "app", "cli"]
+
+
+class _Session:
+    """Holds the interactive-session state (mirrors the 2.x menu spec)."""
+
+    def __init__(self):
+        self.profile_name = "balanced"
+        self.profile = dict(PROFILES["balanced"])
+        self.profile["preserve"] = list(DEFAULT_PRESERVE)
+        self.src_path = None
+        self.src_text = None
+        self.out_path = None
+
+    def custom(self):
+        self.profile_name = "custom"
+
+
+_BANNER = r"""
+ ___      _  __                        _
+| |   __ | |/ _|__ _ _ __  _ __   ___| |_
+| |  / _\| | |_ / _` | '_ \| '_ \ / _ \ __|
+| |__| (_) | |  _| (_| | | | | | | |  __/ |_
+|_____\___/|_|_|  \__,_|_| |_|_| |_|\___|\__|
+"""
+
+
+def _hr(title=""):
+    line = "\u2500" * 58
+    return f"\n\u2500\u2500 {title} ".ljust(61, "\u2500") if title else "\n" + line
+
+
+def _show_state(s):
+    p = s.profile
+    src = s.src_path or ("<pasted code>" if s.src_text is not None else "<none>")
+    out = s.out_path or "<ask at obfuscate time>"
+    print(_hr("state"))
+    print(f"  profile    : {s.profile_name}")
+    print(f"  input      : {src}")
+    print(f"  output     : {out}")
+    print(f"  layers     : {p['layers']}   rename: {p['rename']} "
+          f"({p.get('rename_style','random')})   strings: {p['strings']}")
+    print(f"  numbers    : {p['numbers']}   junk: {p['junk']}   "
+          f"decoys: {p['decoys']}   trash: {p['trash']}")
+    print(f"  anti-debug : {p['antidebug']}   integrity: {p.get('integrity', False)}"
+          f"   bind: {p.get('bind', False)}")
+    print(f"  compress   : {p.get('comp_choice','auto')}   "
+          f"encoding: {p.get('enc_choice','auto')}   "
+          f"chunks: {p.get('chunks', 1)}")
+
+
+def _menu_input():
+    return input("key> ").strip()
+
+
+def _settings_menu(s):
+    while True:
+        p = s.profile
+        print(_hr("settings"))
+        rows = [
+            ("1",  "Profile",            s.profile_name),
+            ("2",  "Layers",             p["layers"]),
+            ("3",  "Rename names",       p["rename"]),
+            ("4",  "Transform strings",  p["strings"]),
+            ("5",  "Compression",        p.get("comp_choice", "auto")),
+            ("6",  "Payload chunks",     "on" if p.get("chunks", 1) > 1 else "off"),
+            ("7",  "Chunk count",        p.get("chunks", 1)),
+            ("8",  "Backup",             p.get("backup_ts", True)),
+            ("9",  "Smoke test",         p.get("smoke", False)),
+            ("10", "Preserve names",     ",".join(p.get("preserve", []))),
+            ("11", "Save config",        "-> lilfuscator.json"),
+            ("12", "Load config",        "<- lilfuscator.json"),
+            ("13", "Name style",         p.get("rename_style", "random")),
+            ("14", "Numbers",            p["numbers"]),
+            ("15", "Junk code",          p["junk"]),
+            ("16", "Docstrings strip",   p["strip_docs"]),
+            ("17", "Anti-debug",         p["antidebug"]),
+            ("18", "Integrity check",    p.get("integrity", False)),
+            ("19", "Encoding",           p.get("enc_choice", "auto")),
+            ("20", "Decoy classes",      p["decoys"]),
+            ("21", "Trash output",       p["trash"]),
+            ("0",  "Back",               ""),
+        ]
+        for k, name, val in rows:
+            print(f"  [{k:>2}] {name:<20} {val}")
+        k = _menu_input()
+        if k == "0":
+            return
+        try:
+            if k == "1":
+                name = input("profile fast/balanced/strong [balanced]: ").strip() or "balanced"
+                s.profile = dict(PROFILES[name])
+                s.profile["preserve"] = list(p.get("preserve", DEFAULT_PRESERVE))
+                s.profile_name = name
+            elif k == "2":
+                s.profile["layers"] = max(1, min(12, int(input("layers 1-12: "))))
+                s.custom()
+            elif k == "3":
+                s.profile["rename"] = not p["rename"]; s.custom()
+            elif k == "4":
+                s.profile["strings"] = not p["strings"]; s.custom()
+            elif k == "5":
+                c = input("compression auto/zlib/lzma/none [auto]: ").strip() or "auto"
+                s.profile["comp_choice"] = {"zlib": "z", "lzma": "x"}.get(c, c)
+                s.custom()
+            elif k == "6":
+                s.profile["chunks"] = 1 if p.get("chunks", 1) > 1 else max(2, p.get("chunks", 4))
+                s.custom()
+            elif k == "7":
+                s.profile["chunks"] = max(2, min(40, int(input("chunks 2-40: "))))
+                s.custom()
+            elif k == "8":
+                s.profile["backup_ts"] = not p.get("backup_ts", True); s.custom()
+            elif k == "9":
+                s.profile["smoke"] = not p.get("smoke", False); s.custom()
+            elif k == "10":
+                raw = input("comma-separated names (empty = defaults): ").strip()
+                s.profile["preserve"] = ([x.strip() for x in raw.split(",") if x.strip()]
+                                         or list(DEFAULT_PRESERVE))
+                s.custom()
+            elif k == "11":
+                save_config("lilfuscator.json", dict(s.profile, base=s.profile_name))
+                print("saved -> lilfuscator.json")
+            elif k == "12":
+                if os.path.exists("lilfuscator.json"):
+                    s.profile = load_config("lilfuscator.json")
+                    s.profile_name = "custom"
+                    print("loaded lilfuscator.json")
+                else:
+                    print("lilfuscator.json not found")
+            elif k == "13":
+                st = input("style random/confusable/hex [random]: ").strip() or "random"
+                s.profile["rename_style"] = st; s.custom()
+            elif k == "14":
+                s.profile["numbers"] = not p["numbers"]; s.custom()
+            elif k == "15":
+                d = int(input("junk density 0-10 [0=off]: ") or 0)
+                s.profile["junk"] = max(0, min(10, d)); s.custom()
+            elif k == "16":
+                s.profile["strip_docs"] = not p["strip_docs"]; s.custom()
+            elif k == "17":
+                s.profile["antidebug"] = not p["antidebug"]; s.custom()
+            elif k == "18":
+                s.profile["integrity"] = not p.get("integrity", False); s.custom()
+            elif k == "19":
+                e = input("encoding auto/b85/b64/hx [auto]: ").strip() or "auto"
+                s.profile["enc_choice"] = e; s.custom()
+            elif k == "20":
+                d = int(input("decoy count 0-10 [0=off]: ") or 0)
+                s.profile["decoys"] = max(0, min(10, d)); s.custom()
+            elif k == "21":
+                d = int(input("trash density 0-10 [0=off]: ") or 0)
+                s.profile["trash"] = max(0, min(10, d)); s.custom()
+        except ValueError:
+            print("invalid value")
+
+
+def _select_input(s):
+    print(_hr("select input"))
+    path = input("path to .py file (empty = paste code): ").strip()
+    if path:
+        if not os.path.exists(path):
+            print("file not found:", path)
+            return
+        s.src_path = path
+        s.src_text = None
+        if not s.out_path:
+            s.out_path = path.rsplit(".py", 1)[0] + "_obf.py"
+        print("loaded:", path)
+        return
+    print("paste code, finish with an empty line, then confirm")
+    lines = []
+    while True:
+        line = input()
+        if line == "":
+            break
+        lines.append(line)
+    if input("use this code? [y/N]: ").strip().lower() == "y":
+        s.src_text = "\n".join(lines) + "\n"
+        s.src_path = None
+        print(f"pasted {len(lines)} lines")
+    else:
+        print("discarded")
+
+
+def _do_obfuscate(s):
+    if s.src_path is None and s.src_text is None:
+        print("no input loaded - use [1] first")
+        return
+    out = s.out_path
+    if not out:
+        out = input("output file: ").strip()
+        if not out:
+            print("no output given")
+            return
+        s.out_path = out
+    try:
+        if s.src_path:
+            info = obfuscate_file(s.src_path, out, s.profile, backup=False)
+        else:
+            loader = obfuscate_source(s.src_text, s.profile)
+            if s.profile.get("backup_ts", True) and os.path.exists(out):
+                shutil.copy2(out, out + "." + time.strftime("%Y%m%d-%H%M%S") + ".bak")
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(loader)
+            info = dict(output=out, out_bytes=len(loader.encode()),
+                        layers=s.profile["layers"], seconds=0)
+        if s.profile.get("backup_ts", True) and s.src_path and os.path.exists(out):
+            pass  # file mode wrote directly; backup handled below
+        print(f"done: {info['out_bytes']} bytes, {info['layers']} layers -> {info['output']}")
+        if s.profile.get("smoke", False):
+            r = _run_file(out)
+            print(f"smoke: rc={r.returncode}")
+            if r.stdout:
+                print(r.stdout.decode(errors="replace"))
+    except Exception as e:
+        print("obfuscate failed:", repr(e))
+
+
 def tui():
+    print(_BANNER)
     print(f"Lilfuscator {VERSION} - interactive mode")
-    print("Empty input at any prompt keeps the default.\n")
-    inp = input("input file: ").strip()
-    if not inp:
-        print("no input given, exiting")
-        return 2
-    outp = input(f"output file [{inp.rsplit('.py',1)[0]}_obf.py]: ").strip()
-    if not outp:
-        outp = inp.rsplit(".py", 1)[0] + "_obf.py"
-    print("profiles: " + ", ".join(PROFILES))
-    prof_name = input("profile [balanced]: ").strip() or "balanced"
-    profile = dict(PROFILES.get(prof_name, PROFILES["balanced"]))
-    lv = input(f"layers 1-12 [{profile['layers']}]: ").strip()
-    if lv:
-        profile["layers"] = max(1, min(12, int(lv)))
-    seed_in = input("seed [random]: ").strip()
-    seed = int(seed_in) if seed_in else None
-    info = obfuscate_file(inp, outp, profile, seed=seed)
-    print(f"\ndone: {info['out_bytes']} bytes, {info['layers']} layers, "
-          f"{info['seconds']}s -> {info['output']}")
-    return 0
+    s = _Session()
+    while True:
+        _show_state(s)
+        print(_hr("main menu"))
+        for k, name, desc in [
+            ("1", "Select input", "load a .py file or paste code directly"),
+            ("2", "Settings",     "configuration menu"),
+            ("3", "Obfuscate",    "run and write the output file"),
+            ("4", "Save config",  "write settings to lilfuscator.json"),
+            ("5", "Load config",  "read settings from lilfuscator.json"),
+            ("0", "Exit",         "quit"),
+        ]:
+            print(f"  [{k}] {name:<14} {desc}")
+        k = _menu_input()
+        if k == "0":
+            return 0
+        if k == "1":
+            _select_input(s)
+        elif k == "2":
+            _settings_menu(s)
+        elif k == "3":
+            _do_obfuscate(s)
+        elif k == "4":
+            save_config("lilfuscator.json", dict(s.profile, base=s.profile_name))
+            print("saved -> lilfuscator.json")
+        elif k == "5":
+            if os.path.exists("lilfuscator.json"):
+                s.profile = load_config("lilfuscator.json")
+                s.profile_name = "custom"
+                print("loaded lilfuscator.json")
+            else:
+                print("lilfuscator.json not found")
 
 
 def main(argv=None):

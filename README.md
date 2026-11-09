@@ -72,6 +72,16 @@ python Lilfuscator.py myscript.py myscript_obf.py 5 --profile strong
 python Lilfuscator.py --help
 ```
 
+### Interactive TUI
+
+Run without arguments to get the 2.x-style menu UI: banner, live state
+panel, main menu (`1` select input - file or paste, `2` settings,
+`3` obfuscate, `4`/`5` save/load `lilfuscator.json`, `0` exit) and a
+21-item settings menu (layers, rename, strings, numbers, compression,
+encoding, payload chunks, backups, smoke test, preserve-names, junk,
+decoys, trash, anti-debug, integrity, docstrings, name style). Any
+manual change marks the profile as `custom`.
+
 ### Interactive mode
 
 Run without arguments:

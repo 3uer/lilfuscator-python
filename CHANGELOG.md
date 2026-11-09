@@ -2,6 +2,31 @@
 
 All notable changes to Lilfuscator. Versioning: `MAJOR.MINOR.PATCH`.
 
+## [2.2.0] - 2026-11-09
+
+### Added
+- **Full 2.0-style interactive TUI**: ASCII banner, live state panel,
+  main menu (1 select input / 2 settings / 3 obfuscate / 4 save config /
+  5 load config / 0 exit) and a 21-item settings menu exactly like the
+  2.0 spec. Paste code directly into the terminal (empty line + `y`).
+- **Preserve-names list**: renamer never touches configurable names
+  (default `__init__`, `__main__`, `main`, `app`, `cli`) - settings `10`.
+- **Payload chunks**: split the blob into 2-40 randomized chunks
+  (settings `6`/`7`).
+- **Integrity check option** (settings `18`): SHA-256 of the marshalled
+  payload, verified inside the loader before exec.
+- **Fixed compression / encoding choices** per layer (settings `5`/`19`):
+  `auto` (random per layer), `zlib`, `lzma`, `none` / `b85`, `b64`, `hx`.
+- **Timestamped backups** (settings `8`) and **smoke test toggle**
+  (settings `9`) in the TUI.
+- Manual changes in Settings switch the profile display to `custom`.
+
+### Changed
+- `pack_payload` accepts `comp_choice` / `enc_choice`; identity
+  decompressor (`'n'`) added to loader dispatch.
+- `LocalRenamer` takes an optional `preserve` set.
+- `build_loader` accepts `code_hash` and emits the pre-exec digest check.
+
 ## [2.1.0] - 2026-11-09
 
 ### Added
