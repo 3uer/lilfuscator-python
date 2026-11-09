@@ -46,6 +46,17 @@ git clone https://github.com/3uer/lilfuscator-python.git
 cd lilfuscator-python
 ```
 
+Single file, zero dependencies: `Lilfuscator.py`.
+
+## ✅ Testing
+
+```bash
+python Lilfuscator.py --selftest   # 12 checks: 4 profiles x 3 scripts, behavior-identical
+```
+
+> ⚠️ The packed payload is marshalled bytecode — **run the obfuscated file
+> with the same Python minor version** used to build it (3.9+).
+
 ## 🎮 Usage
 
 ### CLI mode
