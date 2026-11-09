@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Lilfuscator v1.0.0
+Lilfuscator v2.1.0
 ==================
 Python source-code obfuscator: layered packing, AST transformations,
 decoy classes, junk code, polymorphic loaders, chained-key integrity.
@@ -33,7 +33,7 @@ import sys
 import time
 import zlib
 
-VERSION = "1.0.0"
+VERSION = "2.1.0"
 
 # --------------------------------------------------------------------------
 # Profiles
